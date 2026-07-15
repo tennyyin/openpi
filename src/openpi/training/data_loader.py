@@ -127,10 +127,37 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
+def _split_episodes(
+    num_episodes: int, val_fraction: float, split: Literal["train", "val"], seed: int
+) -> list[int]:
+    """Deterministic episode-level train/val split (no frame leakage across the split).
+
+    Shuffles episode indices with a fixed seed and holds out the last `val_fraction`
+    for val, so the same split is reproduced across processes, resumes, and the two
+    train/val loaders. `val_fraction<=0` -> the val set is empty.
+    """
+    n_val = int(round(num_episodes * val_fraction))
+    n_val = max(0, min(n_val, num_episodes))
+    perm = np.random.default_rng(seed).permutation(num_episodes)
+    val_eps, train_eps = perm[:n_val], perm[n_val:]
+    chosen = val_eps if split == "val" else train_eps
+    return sorted(int(i) for i in chosen)
+
+
 def create_torch_dataset(
-    data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
+    data_config: _config.DataConfig,
+    action_horizon: int,
+    model_config: _model.BaseModelConfig,
+    *,
+    split: Literal["train", "val"] | None = None,
+    val_fraction: float = 0.0,
+    split_seed: int = 0,
 ) -> Dataset:
-    """Create a dataset for training."""
+    """Create a dataset for training.
+
+    If `split` is set and `val_fraction>0`, only the episodes belonging to that split are
+    loaded (episode-level holdout). `split=None` loads the full dataset (original behavior).
+    """
     repo_id = data_config.repo_id
     if repo_id is None:
         raise ValueError("Repo ID is not set. Cannot create dataset.")
@@ -138,6 +165,12 @@ def create_torch_dataset(
         return FakeDataset(model_config, num_samples=1024)
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+
+    # NOTE: we deliberately load the FULL dataset (no episodes= subset) even for a split.
+    # LeRobotDataset's episodes=[...] path reindexes frames but _get_query_indices still
+    # looks up episode_data_index by the raw episode index -> IndexError with
+    # delta_timestamps. Instead we split at the FRAME level with a torch Subset keyed on
+    # each frame's episode_index, which keeps lerobot's internal indexing fully consistent.
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
         delta_timestamps={
@@ -147,6 +180,22 @@ def create_torch_dataset(
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
+
+    if split is not None and val_fraction > 0.0:
+        split_eps = set(_split_episodes(dataset_meta.total_episodes, val_fraction, split, split_seed))
+        if not split_eps:
+            raise ValueError(
+                f"Empty '{split}' split: total_episodes={dataset_meta.total_episodes}, val_fraction={val_fraction}."
+            )
+        # Per-frame episode index -> keep frames whose episode is in the split.
+        base = dataset._dataset if isinstance(dataset, TransformedDataset) else dataset
+        frame_ep = torch.stack(base.hf_dataset["episode_index"]).numpy()
+        frame_indices = np.nonzero(np.isin(frame_ep, list(split_eps)))[0].tolist()
+        logging.info(
+            f"[{split}] {len(split_eps)}/{dataset_meta.total_episodes} episodes -> "
+            f"{len(frame_indices)}/{len(frame_ep)} frames (val_fraction={val_fraction})"
+        )
+        dataset = torch.utils.data.Subset(dataset, frame_indices)
 
     return dataset
 
@@ -228,6 +277,7 @@ def create_data_loader(
     num_batches: int | None = None,
     skip_norm_stats: bool = False,
     framework: Literal["jax", "pytorch"] = "jax",
+    split: Literal["train", "val"] | None = None,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create a data loader for training.
 
@@ -238,11 +288,15 @@ def create_data_loader(
         num_batches: Determines the number of batches to return.
         skip_norm_stats: Whether to skip data normalization.
         framework: The framework to use ("jax" or "pytorch").
+        split: If set and config.val_fraction>0, load only that episode-level split
+            ("train" or "val"). None loads the full dataset.
     """
     data_config = config.data.create(config.assets_dirs, config.model)
     logging.info(f"data_config: {data_config}")
 
     if data_config.rlds_data_dir is not None:
+        if split == "val":
+            raise NotImplementedError("Validation split is not supported for RLDS datasets.")
         return create_rlds_data_loader(
             data_config,
             action_horizon=config.model.action_horizon,
@@ -265,6 +319,8 @@ def create_data_loader(
         seed=config.seed,
         skip_norm_stats=skip_norm_stats,
         framework=framework,
+        split=split,
+        val_fraction=config.val_fraction,
     )
 
 
@@ -281,6 +337,8 @@ def create_torch_data_loader(
     num_workers: int = 0,
     seed: int = 0,
     framework: str = "jax",
+    split: Literal["train", "val"] | None = None,
+    val_fraction: float = 0.0,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create a data loader for training.
 
@@ -298,8 +356,12 @@ def create_torch_data_loader(
         num_workers: The number of worker processes to use. If zero, the data loader will
             execute in the main process.
         seed: The seed to use for shuffling the data.
+        split: Episode-level split to load ("train"/"val"); None loads the full dataset.
+        val_fraction: Fraction of episodes held out for the "val" split.
     """
-    dataset = create_torch_dataset(data_config, action_horizon, model_config)
+    dataset = create_torch_dataset(
+        data_config, action_horizon, model_config, split=split, val_fraction=val_fraction, split_seed=seed
+    )
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 
     # Use TorchDataLoader for both frameworks

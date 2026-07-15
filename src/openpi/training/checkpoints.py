@@ -16,6 +16,19 @@ import openpi.shared.normalize as _normalize
 import openpi.training.data_loader as _data_loader
 import openpi.training.utils as training_utils
 
+# Disable orbax's per-array ArrayMetadata store. Its post-write validation reads the
+# just-written `array_metadatas` file back and JSON-decodes it; on the SageMaker
+# S3-synced checkpoint dir that read returns an empty file -> JSONDecodeError, which
+# crashes the FIRST checkpoint save (~step 1000). The parameter arrays themselves are
+# written via tensorstore/OCDBT and are unaffected -- this only drops the optional
+# metadata self-check. Must run before any CheckpointManager/PyTreeCheckpointHandler is
+# built, since handlers resolve the store from the global registry at construction time.
+ocp.type_handlers.register_type_handler(
+    jax.Array,
+    ocp.type_handlers.ArrayHandler(array_metadata_store=None),
+    override=True,
+)
+
 
 def initialize_checkpoint_dir(
     checkpoint_dir: epath.Path | str, *, keep_period: int | None, overwrite: bool, resume: bool

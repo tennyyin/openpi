@@ -18,6 +18,7 @@ import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
+import openpi.policies.bike_rotor_policy as bike_rotor_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
@@ -463,6 +464,49 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotBikeRotorDataConfig(DataConfigFactory):
+    """Data config for the TRI/LBM BimanualBikeRotorInstall LeRobot dataset (bimanual dual-Panda).
+
+    State = 16-d measured joint state; actions = 20-d cartesian xyzrot6g (absolute).
+    Build the LeRobot dataset with examples/bike_rotor/convert_bike_rotor_to_lerobot.py.
+    """
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # Remap the LeRobot dataset keys to the keys BikeRotorInputs expects.
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "observation.images.base",
+                        "observation/left_wrist_image": "observation.images.left_wrist",
+                        "observation/right_wrist_image": "observation.images.right_wrist",
+                        "observation/state": "observation.state",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        # Robot-specific transforms (applied in training AND inference). Actions stay
+        # absolute -- no DeltaActions transform (state is joint-space, action is task-space).
+        data_transforms = _transforms.Group(
+            inputs=[bike_rotor_policy.BikeRotorInputs(model_type=model_config.model_type)],
+            outputs=[bike_rotor_policy.BikeRotorOutputs()],
+        )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class TrainConfig:
     # Name of the config. Must be unique. Will be used to reference this config.
     name: tyro.conf.Suppress[str]
@@ -516,6 +560,14 @@ class TrainConfig:
     save_interval: int = 1000
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
     keep_period: int | None = 5000
+
+    # Fraction of episodes held out (episode-level, deterministic) for a validation set.
+    # 0 disables validation entirely (original behavior). e.g. 0.05 = 5% of episodes.
+    val_fraction: float = 0.0
+    # How often (in steps) to evaluate and log validation loss. Only used if val_fraction>0.
+    val_interval: int = 1000
+    # Number of val batches to average per evaluation.
+    num_val_batches: int = 20
 
     # If true, will overwrite the checkpoint directory if it already exists.
     overwrite: bool = False
@@ -824,6 +876,42 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=20_000,
         batch_size=64,
+    ),
+    #
+    # Fine-tuning TRI/LBM BimanualBikeRotorInstall configs (bimanual dual-Panda).
+    # State = 16-d measured joint positions+grippers; actions = 20-d cartesian xyzrot6g.
+    # Build the dataset with examples/bike_rotor/convert_bike_rotor_to_lerobot.py, then
+    # `uv run scripts/compute_norm_stats.py --config-name pi0_bike_rotor` before training.
+    #
+    TrainConfig(
+        name="pi0_bike_rotor",
+        # Full fine-tuning of pi0-base (no freeze_filter, no LoRA variant).
+        model=pi0_config.Pi0Config(action_horizon=16),
+        data=LeRobotBikeRotorDataConfig(
+            repo_id="tri/bike_rotor_cartesian",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=30_000,
+        batch_size=32,
+        # Hold out 5% of episodes for validation-loss logging (every val_interval steps).
+        val_fraction=0.05,
+        val_interval=1000,
+    ),
+    TrainConfig(
+        name="pi05_bike_rotor",
+        # Full fine-tuning of pi05-base. pi05 uses quantile normalization automatically.
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=16),
+        data=LeRobotBikeRotorDataConfig(
+            repo_id="tri/bike_rotor_cartesian",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        batch_size=32,
+        # Hold out 5% of episodes for validation-loss logging (every val_interval steps).
+        val_fraction=0.05,
+        val_interval=1000,
     ),
     #
     # Fine-tuning DROID configs.
